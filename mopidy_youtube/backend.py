@@ -11,6 +11,8 @@ from urlparse import parse_qs, urlparse
 from mopidy import backend
 from mopidy.models import Album, SearchResult, Track
 
+from re import findall
+
 import pafy
 
 import pykka
@@ -26,6 +28,34 @@ session = requests.Session()
 video_uri_prefix = 'youtube:video'
 search_uri = 'youtube:search'
 
+
+def parse_iso8601(d):
+    if d[0] != 'P':
+        raise ValueError('Not an ISO 8601 Duration string')
+    seconds = 0
+    # split by the 'T'
+    for i, item in enumerate(d.split('T')):
+        for number, unit in findall( '(?P<number>\d+)(?P<period>S|M|H|D|W|Y)', item ):
+            number = int(number)
+            this = 0
+            if unit == 'Y':
+                this = number * 31557600 # 365.25
+            elif unit == 'W':
+                this = number * 604800
+            elif unit == 'D':
+                this = number * 86400
+            elif unit == 'H':
+                this = number * 3600
+            elif unit == 'M':
+                # ambiguity ellivated with index i
+                if i == 0:
+                    this = number * 2678400 # assume 30 days
+                else:
+                    this = number * 60
+            elif unit == 'S':
+                this = number
+            seconds = seconds + this
+    return seconds
 
 def resolve_track(track, stream=False):
     logger.debug("Resolving YouTube for track '%s'", track)
@@ -86,6 +116,23 @@ def resolve_url(url, stream=False):
     )
     return track
 
+def parse_track(item):
+    images = [
+        image['url']
+        for k, image in item['snippet']['thumbnails'].items()
+        if k in ['high', 'standard']
+        ]
+
+    uri = '%s/%s.%s' % (video_uri_prefix, safe_url(item['snippet']['title']),
+        item['id'])
+
+    return Track(
+        name=item['snippet']['title'],
+        comment=item['id'],
+        album=Album(name='YouTube', images=images),
+        uri=uri,
+        length=parse_iso8601(item['contentDetails']['duration']) * 1000,
+    )
 
 def search_youtube(q):
     query = {
@@ -97,12 +144,18 @@ def search_youtube(q):
     }
     result = session.get(yt_api_endpoint+'search', params=query)
     data = result.json()
+    videos = [item['id']['videoId'] for item in data['items']]
 
-    resolve_pool = ThreadPool(processes=16)
-    playlist = [item['id']['videoId'] for item in data['items']]
+    # We need to query YT API twice to get duration properly
+    query = {
+        'part': 'snippet,contentDetails',
+        'id': ','.join(videos),
+        'key': yt_key
+    }
+    result = session.get(yt_api_endpoint+'videos', params=query)
+    data = result.json()
 
-    playlist = resolve_pool.map(resolve_url, playlist)
-    resolve_pool.close()
+    playlist = [parse_track(item) for item in data['items']]
     return [item for item in playlist if item]
 
 
